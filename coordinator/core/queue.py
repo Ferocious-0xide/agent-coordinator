@@ -1,8 +1,9 @@
-from typing import Optional, Dict, List
-import asyncio
+from typing import Optional, Dict
 import logging
+import asyncio
 from datetime import datetime
-import aioredis
+from redis.asyncio import Redis
+import json
 
 from common.models.task import Task, TaskStatus, TaskPriority
 
@@ -13,27 +14,23 @@ class TaskQueue:
     
     def __init__(self, config: Dict):
         self.config = config
-        self.redis = None
-        self._connect_redis()
-        
-    async def _connect_redis(self):
-        """Initialize Redis connection"""
-        self.redis = await aioredis.from_url(
-            f"redis://{self.config['redis']['host']}:{self.config['redis']['port']}",
-            password=self.config['redis']['password'],
-            db=self.config['redis']['db']
+        self.redis = Redis(
+            host=config['redis']['host'],
+            port=config['redis']['port'],
+            password=config['redis'].get('password'),
+            db=config['redis'].get('db', 0),
+            decode_responses=True
         )
 
     async def enqueue(self, task: Task, priority: TaskPriority = TaskPriority.MEDIUM) -> bool:
         """Add task to queue with priority"""
         try:
-            # Create queue key based on priority
             queue_key = f"task_queue:{priority.value}"
+            task_data = task.model_dump_json()
             
-            # Add task to queue and task details to hash
             async with self.redis.pipeline() as pipe:
                 await pipe.zadd(queue_key, {task.id: datetime.utcnow().timestamp()})
-                await pipe.hset(f"task:{task.id}", mapping=task.dict())
+                await pipe.hset(f"task:{task.id}", mapping={"data": task_data})
                 await pipe.execute()
                 
             logger.debug(f"Task {task.id} enqueued with priority {priority}")
@@ -50,14 +47,15 @@ class TaskQueue:
             
             try:
                 # Get oldest task from highest priority queue
-                task_id = await self.redis.zpopmin(queue_key)
-                if not task_id:
+                result = await self.redis.zpopmin(queue_key)
+                if not result:
                     continue
                     
-                # Get task details
-                task_data = await self.redis.hgetall(f"task:{task_id[0][0]}")
+                task_id = result[0][0]
+                task_data = await self.redis.hget(f"task:{task_id}", "data")
+                
                 if task_data:
-                    return Task(**task_data)
+                    return Task.model_validate_json(task_data)
                     
             except Exception as e:
                 logger.error(f"Error dequeuing task: {e}")
@@ -67,28 +65,45 @@ class TaskQueue:
     async def cancel(self, task_id: str) -> bool:
         """Cancel task if it exists in queue"""
         try:
-            # Check all priority queues
             for priority in TaskPriority:
                 queue_key = f"task_queue:{priority.value}"
-                
-                # Remove from queue if found
                 removed = await self.redis.zrem(queue_key, task_id)
+                
                 if removed:
-                    # Update task status
                     await self.redis.hset(
                         f"task:{task_id}",
-                        "status",
-                        TaskStatus.CANCELLED.value
+                        mapping={"status": TaskStatus.CANCELLED.value}
                     )
                     logger.info(f"Task {task_id} cancelled")
                     return True
                     
-            logger.info(f"Task {task_id} not found in queue")
             return False
             
         except Exception as e:
             logger.error(f"Error cancelling task: {e}")
             return False
+
+    async def cleanup(self):
+        """Remove expired tasks"""
+        try:
+            expiry = datetime.utcnow().timestamp() - self.config['task']['max_lifetime']
+            
+            for priority in TaskPriority:
+                queue_key = f"task_queue:{priority.value}"
+                expired_tasks = await self.redis.zrangebyscore(queue_key, '-inf', expiry)
+                
+                if expired_tasks:
+                    await self.redis.zremrangebyscore(queue_key, '-inf', expiry)
+                    pipe = self.redis.pipeline()
+                    
+                    for task_id in expired_tasks:
+                        pipe.hset(f"task:{task_id}", mapping={"status": TaskStatus.FAILED.value})
+                    
+                    await pipe.execute()
+                    logger.info(f"Removed {len(expired_tasks)} expired tasks from {queue_key}")
+                    
+        except Exception as e:
+            logger.error(f"Error cleaning up expired tasks: {e}")
 
     async def get_length(self) -> Dict[TaskPriority, int]:
         """Get number of tasks in each priority queue"""
@@ -105,31 +120,6 @@ class TaskQueue:
             
         return queue_lengths
 
-    async def cleanup(self):
-        """Remove expired tasks from queues"""
-        try:
-            expiry = datetime.utcnow().timestamp() - self.config['task']['max_lifetime']
-            
-            for priority in TaskPriority:
-                queue_key = f"task_queue:{priority.value}"
-                expired_tasks = await self.redis.zrangebyscore(
-                    queue_key, 
-                    '-inf', 
-                    expiry
-                )
-                
-                if expired_tasks:
-                    await self.redis.zremrangebyscore(queue_key, '-inf', expiry)
-                    
-                    # Update task statuses
-                    for task_id in expired_tasks:
-                        await self.redis.hset(
-                            f"task:{task_id}",
-                            "status",
-                            TaskStatus.FAILED.value
-                        )
-                    
-                    logger.info(f"Removed {len(expired_tasks)} expired tasks from {queue_key}")
-                    
-        except Exception as e:
-            logger.error(f"Error cleaning up expired tasks: {e}")
+    async def close(self):
+        """Close Redis connection"""
+        await self.redis.close()
